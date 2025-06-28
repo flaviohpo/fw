@@ -1,0 +1,67 @@
+#include <stdio.h>
+#include <string.h>
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_system.h"
+#include "esp_log.h"
+
+static const char *TAG = "NVS_DUMP";
+
+void dump_nvs_namespace(const char *namespace) {
+    nvs_iterator_t it = nvs_entry_find("nvs", namespace, NVS_TYPE_ANY);
+    if (it == NULL) {
+        ESP_LOGW(TAG, "Nenhuma entrada encontrada no namespace '%s'", namespace);
+        return;
+    }
+
+    while (it != NULL) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+
+        printf("Chave: %s | Tipo: %d\n", info.key, info.type);
+
+        // Abrir o namespace para leitura
+        nvs_handle_t handle;
+        esp_err_t err = nvs_open(namespace, NVS_READONLY, &handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Erro ao abrir namespace %s: %s", namespace, esp_err_to_name(err));
+            break;
+        }
+
+        // Lê o valor conforme o tipo
+        if (info.type == NVS_TYPE_I32) {
+            int32_t val;
+            if (nvs_get_i32(handle, info.key, &val) == ESP_OK)
+                printf("  Valor (i32): %d\n", val);
+        } else if (info.type == NVS_TYPE_U8) {
+            uint8_t val;
+            if (nvs_get_u8(handle, info.key, &val) == ESP_OK)
+                printf("  Valor (u8): %u\n", val);
+        } else if (info.type == NVS_TYPE_STR) {
+            char str[64];
+            size_t len = sizeof(str);
+            if (nvs_get_str(handle, info.key, str, &len) == ESP_OK)
+                printf("  Valor (str): %s\n", str);
+        } else {
+            printf("  Tipo não suportado\n");
+        }
+
+        nvs_close(handle);
+        it = nvs_entry_next(it);
+    }
+}
+
+void app_main(void)
+{
+    // Inicializa a NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS cheio ou desatualizado, apagando...");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    printf("\n=== Leitura de todas as chaves NVS ===\n");
+    dump_nvs_namespace("armazenamento");  // Namespace que você usa no seu app
+}
