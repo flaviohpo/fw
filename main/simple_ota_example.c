@@ -36,7 +36,7 @@
 #include "ffconf.h"
 #include "errno.h"
 
-#define FW_VERSION 5
+#define FW_VERSION 6
 #define WIFI_CONNECTED_BIT BIT0
 #define HASH_LEN 32
 #define OTA_URL_SIZE 256
@@ -47,6 +47,7 @@ static const char *TAG = "simple_ota_example";
 extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 static bool dev_present = false;
+char * url_for_download;
 
 void simple_ota_example_task(void *pvParameter);
 static EventGroupHandle_t wifi_event_group;
@@ -274,6 +275,9 @@ void download_and_parse_json(const char *url)
     ESP_LOGI("json_update", "Current version: %d", FW_VERSION);
     ESP_LOGI("json_update", "URL do arquivo: %s", file_url ? file_url : "NULL");
     
+    url_for_download = malloc(1+strlen(file_url));
+    strcpy(url_for_download, file_url);
+
     // User code
     if (FW_VERSION < version)
     {
@@ -349,6 +353,7 @@ void simple_ota_example_task(void *pvParameter)
         .if_name = &ifr,
 #endif
     };
+    config.url = url_for_download;
 
 #ifdef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL_FROM_STDIN
     char url_buf[OTA_URL_SIZE];
