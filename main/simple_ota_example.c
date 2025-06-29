@@ -36,7 +36,7 @@
 #include "ffconf.h"
 #include "errno.h"
 
-#define FW_VERSION 6
+#define FW_VERSION 7
 #define WIFI_CONNECTED_BIT BIT0
 #define HASH_LEN 32
 #define OTA_URL_SIZE 256
@@ -278,6 +278,8 @@ void download_and_parse_json(const char *url)
     url_for_download = malloc(1+strlen(file_url));
     strcpy(url_for_download, file_url);
 
+    vTaskDelay(100);
+
     // User code
     if (FW_VERSION < version)
     {
@@ -330,48 +332,14 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 void simple_ota_example_task(void *pvParameter)
 {
     ESP_LOGI(TAG, "Starting OTA example task");
-#ifdef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_BIND_IF
-    esp_netif_t *netif = get_example_netif_from_desc(bind_interface_name);
-    if (netif == NULL) {
-        ESP_LOGE(TAG, "Can't find netif from interface description");
-        abort();
-    }
-    struct ifreq ifr;
-    esp_netif_get_netif_impl_name(netif, ifr.ifr_name);
-    ESP_LOGI(TAG, "Bind interface name is %s", ifr.ifr_name);
-#endif
+
     esp_http_client_config_t config = {
         .url = CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL,
-#ifdef CONFIG_EXAMPLE_USE_CERT_BUNDLE
         .crt_bundle_attach = esp_crt_bundle_attach,
-#else
-        .cert_pem = (char *)server_cert_pem_start,
-#endif /* CONFIG_EXAMPLE_USE_CERT_BUNDLE */
         .event_handler = _http_event_handler,
         .keep_alive_enable = true,
-#ifdef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_BIND_IF
-        .if_name = &ifr,
-#endif
     };
     config.url = url_for_download;
-
-#ifdef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL_FROM_STDIN
-    char url_buf[OTA_URL_SIZE];
-    if (strcmp(config.url, "FROM_STDIN") == 0) {
-        example_configure_stdin_stdout();
-        fgets(url_buf, OTA_URL_SIZE, stdin);
-        int len = strlen(url_buf);
-        url_buf[len - 1] = '\0';
-        config.url = url_buf;
-    } else {
-        ESP_LOGE(TAG, "Configuration mismatch: wrong firmware upgrade image url");
-        abort();
-    }
-#endif
-
-#ifdef CONFIG_EXAMPLE_SKIP_COMMON_NAME_CHECK
-    config.skip_cert_common_name_check = true;
-#endif
 
     esp_https_ota_config_t ota_config = {
         .http_config = &config,
@@ -671,6 +639,8 @@ void app_main(void)
 
     //save_wifi_credentials_to_nvs("VIVOFIBRA-WIFI6-C100", "4aN9cARhgcFcd4E");
     connect_wifi_from_nvs();
+  
+    vTaskDelay(100);
 
     // check information
     download_and_parse_json(URL_JSON);
