@@ -12,6 +12,7 @@
 #include "esp_crt_bundle.h"
 #endif
 
+#include "cJSON.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include <sys/socket.h>
@@ -19,9 +20,49 @@
 #include "esp_wifi.h"
 #endif
 
-//#include "msc_example_main.c"
+// coisas do USB
+#include <stdlib.h>
+#include <assert.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <inttypes.h>
+#include "freertos/queue.h"
+#include "freertos/event_groups.h"
+#include "esp_timer.h"
+#include "esp_err.h"
+#include "usb/usb_host.h"
+#include "usb/msc_host.h"
+#include "usb/msc_host_vfs.h"
+#include "ffconf.h"
+#include "errno.h"
 
-#define FW_VERSION 3
+#define FW_VERSION 5
+#define WIFI_CONNECTED_BIT BIT0
+#define HASH_LEN 32
+#define OTA_URL_SIZE 256
+#define MNT_PATH "/usb"     // Path in the Virtual File System, where the USB flash drive is going to be mounted
+#define BUFFER_SIZE 4096       // The read/write performance can be improved with larger buffer for the cost of RAM, 4kB is enough for most usecases
+
+static const char *TAG = "simple_ota_example";
+extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
+static bool dev_present = false;
+
+void simple_ota_example_task(void *pvParameter);
+static EventGroupHandle_t wifi_event_group;
+const char * URL_JSON = "https://raw.githubusercontent.com/flaviohpo/fw/refs/heads/main/meta.json";
+
+static QueueHandle_t app_queue;
+typedef struct {
+    enum {
+        APP_QUIT,                // Signals request to exit the application
+        APP_DEVICE_CONNECTED,    // USB device connect event
+        APP_DEVICE_DISCONNECTED, // USB device disconnect event
+    } id;
+    union {
+        uint8_t new_dev_address; // Address of new USB device for APP_DEVICE_CONNECTED event if
+    } data;
+} app_message_t;
 
 void print_nvs_stats(const char* partition_label)
 {
@@ -37,23 +78,14 @@ void print_nvs_stats(const char* partition_label)
     }
 }
 
-void simple_ota_example_task(void *pvParameter);
-
-#define WIFI_SSID "POKEMON5G"
-#define WIFI_PASS "m1m1uK1___"
-
-#define WIFI_CONNECTED_BIT BIT0
-
-static EventGroupHandle_t wifi_event_group;
-
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *) event_data;
+        ESP_LOGW("wifi", "Desconectado do Wi-Fi! Motivo: %d", disconn->reason);
         esp_wifi_connect();
-        ESP_LOGW("wifi", "Wi-Fi desconectado, tentando reconectar...");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI("wifi", "Conectado com IP: " IPSTR, IP2STR(&event->ip_info.ip));
@@ -100,7 +132,6 @@ void save_wifi_credentials_to_nvs(const char *ssid, const char *pass)
     nvs_close(handle);
 }
 
-
 void connect_wifi_from_nvs()
 {
     // Inicializa NVS se ainda não
@@ -111,7 +142,7 @@ void connect_wifi_from_nvs()
     }
 
     // Lê SSID e senha da NVS
-    char ssid[32] = {0};
+    char ssid[64] = {0};
     char pass[64] = {0};
     size_t len;
 
@@ -144,13 +175,19 @@ void connect_wifi_from_nvs()
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
     wifi_config_t wifi_config = { 0 };
+    //strcpy((char*) wifi_config.sta.ssid, "VIVOFIBRA-WIFI6-C100");
+    //strcpy((char*) wifi_config.sta.password, "4aN9cARhgcFcd4E");
     strcpy((char*) wifi_config.sta.ssid, ssid);
     strcpy((char*) wifi_config.sta.password, pass);
+    strcpy((char*) wifi_config.sta.sae_h2e_identifier, "");
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
+    esp_log_level_set("wifi", ESP_LOG_INFO);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
 
     ESP_LOGI("wifi", "Conectando a %s...", ssid);
 
@@ -160,10 +197,9 @@ void connect_wifi_from_nvs()
     } else {
         ESP_LOGE("wifi", "Falha ao conectar no Wi-Fi");
     }
+
 }
 
-const char * URL_JSON = "https://raw.githubusercontent.com/flaviohpo/fw/refs/heads/main/meta.json";
-#include "cJSON.h"
 void download_and_parse_json(const char *url)
 {
     esp_http_client_config_t config = {
@@ -255,23 +291,6 @@ void download_and_parse_json(const char *url)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 }
-
-#define HASH_LEN 32
-
-#ifdef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_BIND_IF
-/* The interface name value can refer to if_desc in esp_netif_defaults.h */
-#if CONFIG_EXAMPLE_FIRMWARE_UPGRADE_BIND_IF_ETH
-static const char *bind_interface_name = EXAMPLE_NETIF_DESC_ETH;
-#elif CONFIG_EXAMPLE_FIRMWARE_UPGRADE_BIND_IF_STA
-static const char *bind_interface_name = EXAMPLE_NETIF_DESC_STA;
-#endif
-#endif
-
-static const char *TAG = "simple_ota_example";
-extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
-extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
-
-#define OTA_URL_SIZE 256
 
 esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
@@ -392,6 +411,237 @@ static void get_sha256_of_partitions(void)
     print_sha256(sha_256, "SHA-256 for current firmware: ");
 }
 
+// USB
+static void msc_event_cb(const msc_host_event_t *event, void *arg)
+{
+    if (event->event == MSC_DEVICE_CONNECTED) {
+        ESP_LOGI(TAG, "MSC device connected (usb_addr=%d)", event->device.address);
+        app_message_t message = {
+            .id = APP_DEVICE_CONNECTED,
+            .data.new_dev_address = event->device.address,
+        };
+        xQueueSend(app_queue, &message, portMAX_DELAY);
+    } 
+    else if (event->event == MSC_DEVICE_DISCONNECTED) 
+    {
+        ESP_LOGI(TAG, "MSC device disconnected");
+        app_message_t message = {
+            .id = APP_DEVICE_DISCONNECTED,
+        };
+        xQueueSend(app_queue, &message, portMAX_DELAY);
+    }
+}
+
+static void print_device_info(msc_host_device_info_t *info)
+{
+    const size_t megabyte = 1024 * 1024;
+    uint64_t capacity = ((uint64_t)info->sector_size * info->sector_count) / megabyte;
+
+    printf("Device info:\n");
+    printf("\t Capacity: %llu MB\n", capacity);
+    printf("\t Sector size: %"PRIu32"\n", info->sector_size);
+    printf("\t Sector count: %"PRIu32"\n", info->sector_count);
+    printf("\t PID: 0x%04X \n", info->idProduct);
+    printf("\t VID: 0x%04X \n", info->idVendor);
+#ifndef CONFIG_NEWLIB_NANO_FORMAT
+    wprintf(L"\t iProduct: %S \n", info->iProduct);
+    wprintf(L"\t iManufacturer: %S \n", info->iManufacturer);
+    wprintf(L"\t iSerialNumber: %S \n", info->iSerialNumber);
+#endif
+}
+
+static void trim(char *str) {
+    char *start = str;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != str) memmove(str, start, strlen(start) + 1);
+    char *end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+}
+
+static void file_operations(void)
+{
+    const char *file_path = "/usb/wifi.txt";
+
+    FILE *f = fopen(file_path, "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+        return;
+    }
+
+    char ssid[64] = {0};
+    char pass[64] = {0};
+
+    if (fgets(ssid, sizeof(ssid), f) == NULL) {
+        ESP_LOGE(TAG, "Erro ao ler a primeira linha (SSID)");
+        fclose(f);
+        return;
+    }
+
+    if (fgets(pass, sizeof(pass), f) == NULL) {
+        ESP_LOGE(TAG, "Erro ao ler a segunda linha (senha)");
+        fclose(f);
+        return;
+    }
+
+    fclose(f);
+
+    // Remove quebras de linha e espaços
+    ssid[strcspn(ssid, "\r\n")] = '\0';
+    pass[strcspn(pass, "\r\n")] = '\0';
+
+    trim(ssid);
+    trim(pass);
+
+    // Debug bytes
+    ESP_LOGI(TAG, "SSID lido: '%s'", ssid);
+    ESP_LOGI(TAG, "Senha lida: '%s'", pass);
+
+    //save_wifi_credentials_to_nvs("VIVOFIBRA-WIFI6-C100", "4aN9cARhgcFcd4E");
+    save_wifi_credentials_to_nvs(ssid, pass);
+}
+
+static void usb_task(void *args)
+{
+    const usb_host_config_t host_config = { .intr_flags = ESP_INTR_FLAG_LEVEL1 };
+    ESP_ERROR_CHECK(usb_host_install(&host_config));
+
+    const msc_host_driver_config_t msc_config = {
+        .create_backround_task = true,
+        .task_priority = 5,
+        .stack_size = 4096,
+        .callback = msc_event_cb,
+    };
+    ESP_ERROR_CHECK(msc_host_install(&msc_config));
+
+    bool has_clients = true;
+    while (true) {
+        uint32_t event_flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
+
+        // Release devices once all clients has deregistered
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS) {
+            has_clients = false;
+            if (usb_host_device_free_all() == ESP_OK) {
+                break;
+            };
+        }
+        if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE && !has_clients) {
+            break;
+        }
+    }
+
+    vTaskDelay(10); // Give clients some time to uninstall
+    ESP_LOGI(TAG, "Deinitializing USB");
+    ESP_ERROR_CHECK(usb_host_uninstall());
+    vTaskDelete(NULL);
+}
+
+void read_usb_flash(void)
+{
+    // Criação da fila
+    app_queue = xQueueCreate(5, sizeof(app_message_t));
+    assert(app_queue);
+
+    // Criação da task usb_task
+    BaseType_t task_created = xTaskCreate(usb_task, "usb_task", 4096, NULL, 2, NULL);
+    assert(task_created == pdPASS);
+
+    ESP_LOGI(TAG, "Waiting for USB flash drive to be connected");
+
+    msc_host_device_handle_t msc_device = NULL;
+    msc_host_vfs_handle_t vfs_handle = NULL;
+    bool msc_installed = false;
+    bool should_exit = false;
+
+    while (!should_exit) {
+        app_message_t msg;
+        BaseType_t received = xQueueReceive(app_queue, &msg, pdMS_TO_TICKS(10000)); // Timeout de 10 segundos
+
+        if (received != pdTRUE) {
+            // Timeout
+            ESP_LOGW(TAG, "Timeout de 10 segundos aguardando mensagem");
+            if (!dev_present) {
+                should_exit = true;
+                continue;
+            }
+            continue;
+        }
+
+        if (msg.id == APP_DEVICE_CONNECTED) {
+            if (dev_present) {
+                ESP_LOGW(TAG, "MSC já conectado. Ignorando novo dispositivo.");
+                continue;
+            }
+
+            dev_present = true;
+            ESP_LOGI(TAG, "Dispositivo USB conectado");
+
+            // Instala e monta o dispositivo
+            ESP_ERROR_CHECK(msc_host_install_device(msg.data.new_dev_address, &msc_device));
+            msc_installed = true;
+
+            const esp_vfs_fat_mount_config_t mount_config = {
+                .format_if_mount_failed = false,
+                .max_files = 3,
+                .allocation_unit_size = 8192,
+            };
+            ESP_ERROR_CHECK(msc_host_vfs_register(msc_device, MNT_PATH, &mount_config, &vfs_handle));
+
+            msc_host_device_info_t info;
+            ESP_ERROR_CHECK(msc_host_get_device_info(msc_device, &info));
+            msc_host_print_descriptors(msc_device);
+            print_device_info(&info);
+
+            // Listar arquivos no root
+            ESP_LOGI(TAG, "Conteúdo do diretório /usb:");
+            DIR *dh = opendir(MNT_PATH);
+            if (dh) {
+                struct dirent *d;
+                while ((d = readdir(dh)) != NULL) {
+                    printf("  %s\n", d->d_name);
+                }
+                closedir(dh);
+            } else {
+                ESP_LOGE(TAG, "Erro ao abrir diretório %s", MNT_PATH);
+            }
+
+            // Executar operações com arquivos
+            file_operations();
+
+            ESP_LOGI(TAG, "Operações concluídas. Você pode remover o pendrive.");
+        }
+
+        else if (msg.id == APP_DEVICE_DISCONNECTED) {
+            ESP_LOGI(TAG, "Dispositivo desconectado");
+            dev_present = false;
+
+            if (vfs_handle) {
+                ESP_ERROR_CHECK(msc_host_vfs_unregister(vfs_handle));
+                vfs_handle = NULL;
+            }
+
+            if (msc_device) {
+                ESP_ERROR_CHECK(msc_host_uninstall_device(msc_device));
+                msc_device = NULL;
+            }
+
+            should_exit = true; // encerra o loop
+        }
+    }
+
+    // Finalização segura
+    if (msc_installed) {
+        ESP_LOGI(TAG, "Desinstalando host MSC");
+        ESP_ERROR_CHECK(msc_host_uninstall());
+    }
+
+    vQueueDelete(app_queue);
+    ESP_LOGI(TAG, "read_usb_flash finalizado");
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "OTA example app_main start");
@@ -409,29 +659,21 @@ void app_main(void)
 
     get_sha256_of_partitions();
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
-    save_wifi_credentials_to_nvs(WIFI_SSID, WIFI_PASS);
-    connect_wifi_from_nvs();
-
-#if CONFIG_EXAMPLE_CONNECT_WIFI
-    /* Ensure to disable any WiFi power save mode, this allows best throughput
-     * and hence timings for overall OTA operation.
-     */
-    esp_wifi_set_ps(WIFI_PS_NONE);
-#endif // CONFIG_EXAMPLE_CONNECT_WIFI
-
     // debug and security purpose
     print_nvs_stats("nvs");
+
+    read_usb_flash();
+
+    //save_wifi_credentials_to_nvs("VIVOFIBRA-WIFI6-C100", "4aN9cARhgcFcd4E");
+    connect_wifi_from_nvs();
 
     // check information
     download_and_parse_json(URL_JSON);
 
     // user application
-
+    ESP_LOGI(TAG, "Executando user application...");
+    while(1)
+    {
+        vTaskDelay(1);
+    }
 }
